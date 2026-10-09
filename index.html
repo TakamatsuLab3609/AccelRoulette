@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>加速ルーレット</title>
+<meta name="description" content="左クリックで加速、右クリックで減速。効果音つきの手動ルーレット。">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Dela+Gothic+One&family=JetBrains+Mono:wght@500;700&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<!-- APP:START -->
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <h1>加速ルーレット</h1>
+    </div>
+    <p class="howto">
+      <span class="howto-mouse"><kbd>左クリック</kbd>加速</span>
+      <span class="howto-mouse"><kbd>右クリック</kbd>減速</span>
+      <span class="howto-keys"><kbd>Space</kbd><kbd>↑</kbd>加速 <kbd>↓</kbd>減速</span>
+      <span class="howto-touch"><kbd>盤をタップ</kbd>加速</span>
+      <span class="howto-touch"><kbd>減速ボタン</kbd>ブレーキ</span>
+    </p>
+  </header>
+
+  <main class="layout">
+    <section class="stage" aria-label="ルーレット">
+      <div class="now" aria-live="off">
+        <span class="now-label">針の位置</span>
+        <span class="now-chip" id="nowChip" aria-hidden="true"></span>
+        <span class="now-value" id="nowValue">—</span>
+      </div>
+
+      <div class="wheel-wrap" id="wheelWrap" tabindex="0" title="左クリックで加速 / 右クリックで減速">
+        <canvas id="wheel" role="img" aria-label="ルーレット盤。左クリックで加速、右クリックで減速"></canvas>
+      </div>
+
+      <div class="controls">
+        <button type="button" class="ctl ctl-brake" id="btnBrake" aria-label="減速">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6h4v12H6zM14 6h4v12h-4z"/></svg>
+          <span>減速</span>
+        </button>
+        <div class="meter" aria-label="回転速度">
+          <div class="meter-read"><span class="meter-num" id="rpmValue">0</span><span class="meter-unit">rpm</span></div>
+          <div class="meter-bar"><div class="meter-fill" id="rpmFill"></div></div>
+          <div class="meter-state" id="stateLabel">待機中</div>
+        </div>
+        <button type="button" class="ctl ctl-accel" id="btnAccel" aria-label="加速">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6l8 6-8 6zM12 6l8 6-8 6z"/></svg>
+          <span>加速</span>
+        </button>
+      </div>
+      <p class="status" id="status" aria-live="polite">盤を左クリックしてスタート</p>
+    </section>
+
+    <aside class="panel">
+      <section class="items" aria-labelledby="itemsLabel">
+        <div class="items-head">
+          <label id="itemsLabel" for="itemsInput">項目</label>
+          <span class="items-count" id="itemCount">0 項目</span>
+          <button type="button" class="btn-text" id="btnShuffle">シャッフル</button>
+        </div>
+        <textarea id="itemsInput" spellcheck="false" autocomplete="off" placeholder="1行に1項目ずつ入力&#10;例）&#10;カレー&#10;ラーメン&#10;寿司"></textarea>
+        <p class="hint">改行で区切った順に盤へ並びます。同じ文字列は同じ色。空行は無視されます。</p>
+      </section>
+
+      <section class="tabs">
+        <div class="tablist" role="tablist" aria-label="設定">
+          <button type="button" role="tab" id="tab-play" aria-controls="panel-play" aria-selected="true">操作</button>
+          <button type="button" role="tab" id="tab-sound" aria-controls="panel-sound" aria-selected="false" tabindex="-1">サウンド</button>
+          <button type="button" role="tab" id="tab-history" aria-controls="panel-history" aria-selected="false" tabindex="-1">履歴 <span class="badge" id="historyCount">0</span></button>
+        </div>
+
+        <!-- 操作 -->
+        <div class="tabpanel" role="tabpanel" id="panel-play" aria-labelledby="tab-play">
+          <div class="field">
+            <label for="setAccel">加速量 <small>左クリック1回</small></label>
+            <div class="num"><input type="number" id="setAccel" min="1" step="1" inputmode="decimal"><span>rpm</span></div>
+          </div>
+          <div class="field">
+            <label for="setBrake">減速量 <small>右クリック1回</small></label>
+            <div class="num"><input type="number" id="setBrake" min="1" step="1" inputmode="decimal"><span>rpm</span></div>
+          </div>
+          <div class="field">
+            <label for="setFriction">自然減速 <small>摩擦の強さ・0で減速なし</small></label>
+            <div class="num"><input type="number" id="setFriction" min="0" max="50" step="0.5" inputmode="decimal"><span>&nbsp;</span></div>
+          </div>
+          <div class="field">
+            <label for="setMax">最高速度 <small>0で無制限</small></label>
+            <div class="num"><input type="number" id="setMax" min="0" step="10" inputmode="decimal"><span>rpm</span></div>
+          </div>
+
+          <div class="divider"></div>
+
+          <label class="switch">
+            <input type="checkbox" role="switch" id="setHold">
+            <span class="switch-track" aria-hidden="true"></span>
+            <span class="switch-text">長押しで連打<small>押しっぱなしで加速・減速が続く</small></span>
+          </label>
+          <div class="field field-sub" id="holdRateField">
+            <label for="setHoldRate">連打の速さ</label>
+            <div class="num"><input type="number" id="setHoldRate" min="1" max="30" step="1" inputmode="decimal"><span>回/秒</span></div>
+          </div>
+
+          <label class="switch">
+            <input type="checkbox" role="switch" id="setAutoRemove">
+            <span class="switch-track" aria-hidden="true"></span>
+            <span class="switch-text">当選したら自動で除外<small>結果を閉じるとリストから消える</small></span>
+          </label>
+
+          <div class="panel-foot">
+            <button type="button" class="btn-text" id="btnResetSettings">設定を初期値に戻す</button>
+          </div>
+        </div>
+
+        <!-- サウンド -->
+        <div class="tabpanel" role="tabpanel" id="panel-sound" aria-labelledby="tab-sound" hidden>
+          <div class="volume">
+            <button type="button" class="mute" id="btnMute" aria-pressed="false" aria-label="ミュート">
+              <svg class="ico-on" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16 8.5a5 5 0 0 1 0 7M18.5 6a8.5 8.5 0 0 1 0 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+              <svg class="ico-off" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16.5 9.5l5 5M21.5 9.5l-5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            </button>
+            <label class="sr-only" for="setVolume">音量</label>
+            <input type="range" id="setVolume" min="0" max="100" step="1">
+            <span class="volume-num" id="volumeValue">70</span>
+          </div>
+
+          <fieldset class="group">
+            <legend>サウンドテーマ</legend>
+            <div class="themes" id="themeList"></div>
+          </fieldset>
+
+          <fieldset class="group">
+            <legend>鳴らす音</legend>
+            <div class="events" id="eventList"></div>
+          </fieldset>
+        </div>
+
+        <!-- 履歴 -->
+        <div class="tabpanel" role="tabpanel" id="panel-history" aria-labelledby="tab-history" hidden>
+          <ol class="history" id="historyList"></ol>
+          <p class="empty" id="historyEmpty">まだ結果はありません。</p>
+          <div class="panel-foot">
+            <button type="button" class="btn-text danger" id="btnClearHistory">履歴を消去</button>
+          </div>
+        </div>
+      </section>
+    </aside>
+  </main>
+</div>
+
+<div class="modal" id="resultModal" hidden>
+  <div class="modal-backdrop" data-close></div>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="resultTitle">
+    <p class="modal-eyebrow" id="resultMeta">当選</p>
+    <div class="result-band" id="resultBand">
+      <h2 class="result-text" id="resultTitle">—</h2>
+    </div>
+    <p class="modal-note" id="resultNote" hidden>閉じるとリストから除外されます</p>
+    <div class="modal-actions">
+      <button type="button" class="btn" id="btnRemoveOne">この項目を除外</button>
+      <button type="button" class="btn" id="btnRemoveAll" hidden>同じ項目をすべて除外</button>
+      <button type="button" class="btn btn-primary" id="btnCloseResult" data-close>閉じる</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" hidden>
+  <span id="toastText"></span>
+  <button type="button" class="btn-text" id="toastUndo">元に戻す</button>
+</div>
+
+<canvas class="confetti" id="confetti" aria-hidden="true"></canvas>
+<!-- APP:END -->
+
+<script src="sounds.js"></script>
+<script src="script.js"></script>
+</body>
+</html>

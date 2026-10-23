@@ -638,7 +638,7 @@
     }
   }
 
-  // ボールがマスに入った：すぐには発表せず、ズームアップしてから盤が止まる直前に発表
+  // ボールがマスに入った：すぐには発表せず、ズームアップ → 全体に戻ってから発表
   function onBallSettled(now) {
     Sound.stopRoll();
     const p = pockets[ball.pocket];
@@ -646,14 +646,15 @@
     if (it) startReveal(now, it, ball.pocket);
   }
 
-  // ボールがマスに入ってから結果発表まで：ズームアップ → 盤が止まる直前に発表
+  // ボールがマスに入ってから結果発表まで：ズームアップ → 全体に戻る → その RESULT_AFTER_ZOOM 秒後に発表
+  // （盤がまだ回っていても、止まるのは待たない）
   const ZOOM_IN = 0.7;       // ズームアップにかける秒数
-  const ZOOM_HOLD_MIN = 1.3; // ズームしたまま見せる最短の秒数
-  const ZOOM_HOLD_MAX = 2.3; // 盤がなかなか止まらないときは、ここで全体に戻る
+  const ZOOM_HOLD_MIN = 1.3; // ズームしたまま見せる秒数（発表までに盤が止まるとき）
+  const ZOOM_HOLD_MAX = 2.3; // ズームしたまま見せる秒数（盤がまだ回り続けるとき）
   const ZOOM_OUT = 0.6;
-  const REVEAL_LEAD = 0.9;   // 盤が止まるこの秒数前に結果のポップアップを出す
+  const RESULT_AFTER_ZOOM = 1.0;   // ズームが終わってから結果のポップアップが出るまでの秒数
   const REVEAL_POPUP_DELAY = 0.15; // 発表の音を鳴らしてからポップアップが出るまで
-  const REVEAL_AT = REVEAL_LEAD + REVEAL_POPUP_DELAY; // 発表を始める「止まるまでの残り秒数」
+  const REVEAL_START = Math.max(0, RESULT_AFTER_ZOOM - REVEAL_POPUP_DELAY); // ズームが終わってから発表の音を鳴らすまで
   const reveal = { phase: 'none', t0: 0, start: 0, item: null, pocket: -1, eStart: 0, from: 0 };
   const cam = { e: 0, theta: 0 }; // e: ズームの度合い（0〜1） theta: 見せるマスの向き
 
@@ -769,7 +770,8 @@
       if (t >= ZOOM_IN) Object.assign(reveal, { phase: 'hold', t0: now });
     } else if (reveal.phase === 'hold') {
       cam.e = 1;
-      if (t >= ZOOM_HOLD_MIN && (tts <= ZOOM_OUT + REVEAL_AT || t >= ZOOM_HOLD_MAX)) {
+      // 発表までに盤が止まるなら短め、まだ回り続けるなら長めにズームを見せる
+      if (t >= ZOOM_HOLD_MIN && (tts <= ZOOM_OUT + RESULT_AFTER_ZOOM || t >= ZOOM_HOLD_MAX)) {
         cam.theta = normAngle(cam.theta); // 近い向きを通って全体に戻る
         Object.assign(reveal, { phase: 'zoomOut', t0: now });
       }
@@ -777,18 +779,17 @@
       cam.e = 1 - easeInOut(t / ZOOM_OUT);
       if (t >= ZOOM_OUT) {
         cam.e = 0;
-        Object.assign(reveal, { phase: 'wait', t0: now });
+        Object.assign(reveal, { phase: 'wait', t0: now }); // ここでズームが終わる
       }
     }
-    if (reveal.phase === 'wait' && tts <= REVEAL_AT) {
+    // ズームが終わってから RESULT_AFTER_ZOOM 秒後にポップアップが出るように発表する
+    if (reveal.phase === 'wait' && now - reveal.t0 >= REVEAL_START) {
       finishReveal(now);
       return;
     }
-    // 結果発表に向けてドラムロール
-    if (reveal.phase !== 'zoomIn' && (!spin.active || tts <= ROLL_WINDOW)) {
-      const k = spin.active
-        ? 1 - (tts - REVEAL_AT) / (ROLL_WINDOW - REVEAL_AT)
-        : (now - reveal.start - ZOOM_IN) / (ZOOM_HOLD_MIN + ZOOM_OUT);
+    // 結果発表に向けてドラムロール（ズームしきってから発表まで、だんだん強く）
+    if (reveal.phase !== 'zoomIn') {
+      const k = (now - reveal.start - ZOOM_IN) / (ZOOM_HOLD_MIN + ZOOM_OUT + REVEAL_START);
       Sound.setRollIntensity(clamp(k, 0.2, 1));
       if (!Sound.rolling) Sound.startRoll();
     } else if (Sound.rolling) {
@@ -1747,10 +1748,7 @@
     if (casino) {
       if (charge.active) return '離すと発射！';
       if (reveal.phase === 'zoomIn' || reveal.phase === 'hold') return 'ボールが入った！';
-      if (revealPending()) {
-        if (!spin.active) return 'まもなく結果発表…';
-        return settings.friction > 0 ? '盤が止まると結果発表…' : '右クリックで盤を止めると結果発表';
-      }
+      if (revealPending()) return 'まもなく結果発表…';
       if (ball.state === 'track') return `ボール周回中 ${Math.round(ball.rpm())} rpm`;
       if (ball.state === 'bowl') return 'ボールが落ちた！';
       if (ball.state === 'rotor') return 'ボールが跳ねている…';

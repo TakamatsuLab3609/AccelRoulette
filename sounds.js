@@ -27,10 +27,14 @@
   let muted = false;
   let themeId = 'classic';
 
-  const enabled = { tick: true, boost: true, brake: true, hum: true, roll: true, result: true };
+  const enabled = { tick: true, boost: true, brake: true, hum: true, roll: true, result: true, ball: true };
 
   let hum = null;          // 回転中の持続音
   let humIdleSince = 0;
+  let ballRoll = null;     // ボールが転がる持続音（カジノモード）
+  let chargeVoice = null;  // パワーをためている間の音
+  let ballIdleSince = 0;
+  let lastBallHitAt = -1;
   const roll = { active: false, next: 0, intensity: 0 };
   let lastTickAt = -1;
 
@@ -428,6 +432,100 @@
   }
 
   /* ------------------------------------------------------------------ */
+  /* ボールの音（カジノモード）                                              */
+  /*   テーマに ball がなければ、この実物っぽい音を使う                        */
+  /* ------------------------------------------------------------------ */
+
+  const BALL = {
+    roll: { kind: 'noise', fMin: 700, fMax: 3300, q: 0.8, g: 0.5, rumble: 0.4 },
+    throw(t, v) {
+      // 強く投げるほど「シュッ」が長く高く
+      noise({ t, a: 0.01, d: 0.07 + 0.1 * v, g: 0.15 + 0.25 * v, type: 'highpass', f: 1500, f2: 3500 + 3500 * v, q: 0.7 });
+      osc({ t: t + 0.07, f: 3200, a: 0.001, d: 0.02, g: 0.16 });
+      noise({ t: t + 0.07, d: 0.012, g: 0.22, type: 'highpass', f: 5000, q: 0.7 });
+    },
+    drop(t) {
+      noise({ t, a: 0.01, d: 0.1, g: 0.25, type: 'bandpass', f: 1300, f2: 800, q: 1.5 });
+    },
+    diamond(t, v) {
+      const f = rand(2300, 2700);
+      osc({ t, f, a: 0.001, d: 0.05, g: 0.3 * v });
+      osc({ t, f: f * 2.6, a: 0.001, d: 0.03, g: 0.12 * v });
+      noise({ t, d: 0.012, g: 0.6 * v, type: 'bandpass', f: 4000, q: 2 });
+    },
+    rotor(t, v) {
+      osc({ t, f: 520, f2: 380, a: 0.002, d: 0.08, g: 0.32 * v });
+      noise({ t, d: 0.03, g: 0.4 * v, type: 'bandpass', f: 1600, q: 1.2 });
+      osc({ t, f: 2500, a: 0.001, d: 0.015, g: 0.14 * v });
+    },
+    fret(t, v) {
+      const f = rand(3000, 3800);
+      osc({ t, f, a: 0.001, d: 0.03, g: 0.22 * v });
+      osc({ t, f: f * 2.3, a: 0.001, d: 0.015, g: 0.08 * v });
+      noise({ t, d: 0.008, g: 0.3 * v, type: 'highpass', f: 6000, q: 0.7 });
+      osc({ t, f: 900, a: 0.001, d: 0.03, g: 0.12 * v });
+    },
+    land(t, v) {
+      osc({ t, f: rand(700, 900), a: 0.001, d: 0.04, g: 0.22 * v });
+      noise({ t, d: 0.015, g: 0.3 * v, type: 'bandpass', f: 2000, q: 1.5 });
+    },
+    settle(t) {
+      osc({ t, f: 650, a: 0.001, d: 0.06, g: 0.32 });
+      osc({ t, f: 1300, a: 0.001, d: 0.03, g: 0.1 });
+      osc({ t: t + 0.075, f: 700, a: 0.001, d: 0.05, g: 0.16 });
+    },
+    // 盤の急加速でポケットから飛び出す「カコーン」
+    eject(t, v) {
+      osc({ t, f: 900, f2: 1500, glide: 0.06, a: 0.001, d: 0.06, g: 0.1 + 0.25 * v });
+      noise({ t, d: 0.02, g: 0.2 + 0.4 * v, type: 'bandpass', f: 3200, q: 2 });
+      noise({ t: t + 0.02, a: 0.02, d: 0.18, g: 0.1 + 0.15 * v, type: 'highpass', f: 1500, f2: 4500, q: 0.7 });
+    },
+    // マスに入った瞬間のズームアップ「シュワーン」
+    zoom(t) {
+      noise({ t: t + 0.08, a: 0.35, d: 0.45, g: 0.22, type: 'bandpass', f: 350, f2: 2400, glide: 0.6, q: 1.2 });
+      osc({ t: t + 0.08, f: 110, f2: 220, glide: 0.6, a: 0.3, d: 0.5, g: 0.16 });
+      bell(t + 0.75, 1568, 0.08, 0.9);
+    },
+  };
+
+  // レトロゲームだけはボールの音も 8bit に
+  THEMES.retro.ball = {
+    roll: { kind: 'osc', type: 'square', fMin: 90, fMax: 360, lp: 1300, g: 0.08 },
+    throw(t, v) {
+      osc({ t, type: 'square', f: 300 + 200 * v, f2: 900 + 1100 * v, glide: 0.12, a: 0.003, d: 0.14, g: 0.2 });
+    },
+    drop(t) {
+      osc({ t, type: 'square', f: 700, f2: 350, glide: 0.1, a: 0.003, d: 0.1, g: 0.14 });
+    },
+    diamond(t, v) {
+      osc({ t, type: 'square', f: 1800, a: 0.001, d: 0.04, g: 0.18 * v });
+    },
+    rotor(t, v) {
+      osc({ t, type: 'square', f: 300, f2: 180, a: 0.002, d: 0.07, g: 0.2 * v });
+    },
+    fret(t, v) {
+      osc({ t, type: 'square', f: rand(1300, 1700), a: 0.001, d: 0.025, g: 0.16 * v });
+    },
+    land(t, v) {
+      osc({ t, type: 'square', f: rand(500, 650), a: 0.001, d: 0.03, g: 0.14 * v });
+    },
+    settle(t) {
+      chip({ t, type: 'square', f: 880, dur: 0.06, g: 0.12 });
+      chip({ t: t + 0.07, type: 'square', f: 1320, dur: 0.1, g: 0.12 });
+    },
+    zoom(t) {
+      osc({ t: t + 0.08, type: 'square', f: 200, f2: 900, glide: 0.55, a: 0.02, d: 0.6, g: 0.07 });
+    },
+    eject(t) {
+      osc({ t, type: 'square', f: 500, f2: 1400, glide: 0.1, a: 0.002, d: 0.12, g: 0.16 });
+    },
+  };
+
+  function ballSounds() {
+    return theme().ball || BALL;
+  }
+
+  /* ------------------------------------------------------------------ */
   /* 回転中の持続音                                                        */
   /* ------------------------------------------------------------------ */
 
@@ -479,6 +577,119 @@
     return h;
   }
 
+  function buildBallRoll() {
+    const p = ballSounds().roll;
+    const v = { themeId, p };
+    const out = ctx.createGain();
+    out.gain.value = 0;
+    out.connect(bus);
+    if (p.kind === 'osc') {
+      const o = ctx.createOscillator();
+      o.type = p.type;
+      o.frequency.value = p.fMin;
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.value = p.lp;
+      o.connect(lp);
+      lp.connect(out);
+      o.start();
+      Object.assign(v, { srcs: [o], osc: o, out });
+      return v;
+    }
+    // 転がる「ゴロゴロ」：高めのノイズを細かく揺らし、低いうなりを重ねる
+    const hiSrc = ctx.createBufferSource();
+    hiSrc.buffer = noiseBuffer;
+    hiSrc.loop = true;
+    const hi = ctx.createBiquadFilter();
+    hi.type = 'bandpass';
+    hi.frequency.value = p.fMin;
+    hi.Q.value = p.q;
+    const am = ctx.createGain();
+    am.gain.value = 0.7;
+    const lfo = ctx.createOscillator();
+    lfo.type = 'triangle';
+    lfo.frequency.value = 9;
+    const lfoGain = ctx.createGain();
+    lfoGain.gain.value = 0.3;
+    lfo.connect(lfoGain);
+    lfoGain.connect(am.gain);
+    hiSrc.connect(hi);
+    hi.connect(am);
+    am.connect(out);
+    const loSrc = ctx.createBufferSource();
+    loSrc.buffer = noiseBuffer;
+    loSrc.loop = true;
+    loSrc.loopStart = 1;
+    const lo = ctx.createBiquadFilter();
+    lo.type = 'lowpass';
+    lo.frequency.value = 220;
+    const loGain = ctx.createGain();
+    loGain.gain.value = p.rumble;
+    loSrc.connect(lo);
+    lo.connect(loGain);
+    loGain.connect(out);
+    hiSrc.start();
+    loSrc.start(0, 1);
+    lfo.start();
+    Object.assign(v, { srcs: [hiSrc, loSrc, lfo], hi, lo, lfo, out });
+    return v;
+  }
+
+  // パワーをためている間の「ウィーン」（パワーに合わせて音の高さが上下する）
+  function buildCharge() {
+    const retro = themeId === 'retro';
+    const o = ctx.createOscillator();
+    o.type = retro ? 'square' : 'triangle';
+    o.frequency.value = 220;
+    const vib = ctx.createOscillator();
+    vib.frequency.value = 7;
+    const vibGain = ctx.createGain();
+    vibGain.gain.value = retro ? 0 : 6;
+    vib.connect(vibGain);
+    vibGain.connect(o.frequency);
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 2400;
+    const out = ctx.createGain();
+    out.gain.value = 0;
+    o.connect(lp);
+    lp.connect(out);
+    out.connect(bus);
+    o.start();
+    vib.start();
+    return { themeId, osc: o, srcs: [o, vib], out, level: retro ? 0.05 : 0.1 };
+  }
+
+  function destroyCharge() {
+    if (!chargeVoice) return;
+    const v = chargeVoice;
+    chargeVoice = null;
+    const t = ctx.currentTime;
+    v.out.gain.cancelScheduledValues(t);
+    v.out.gain.setTargetAtTime(0, t, 0.02);
+    setTimeout(() => {
+      try {
+        v.srcs.forEach((n) => n.stop());
+        v.out.disconnect();
+      } catch (e) { /* noop */ }
+    }, 200);
+  }
+
+  function destroyBallRoll() {
+    if (!ballRoll) return;
+    const v = ballRoll;
+    ballRoll = null;
+    const t = ctx.currentTime;
+    v.out.gain.cancelScheduledValues(t);
+    v.out.gain.setTargetAtTime(0, t, 0.03);
+    setTimeout(() => {
+      try {
+        v.srcs.forEach((n) => n.stop());
+        v.out.disconnect();
+      } catch (e) { /* noop */ }
+    }, 300);
+  }
+
   function destroyHum() {
     if (!hum) return;
     const h = hum;
@@ -504,6 +715,7 @@
       { id: 'hum', name: '回転音', desc: '速さに合わせてうなる' },
       { id: 'roll', name: 'ドラムロール', desc: '止まる直前に' },
       { id: 'result', name: '当選音', desc: 'ファンファーレ' },
+      { id: 'ball', name: 'ボールの音', desc: '転がる・跳ねる（カジノ）' },
     ],
 
     unlock() {
@@ -532,6 +744,7 @@
       if (!THEMES[id]) return;
       themeId = id;
       if (hum && hum.themeId !== id) destroyHum();
+      if (ballRoll && ballRoll.themeId !== id) destroyBallRoll();
     },
 
     setEnabled(key, on) {
@@ -622,6 +835,86 @@
         while (roll.next < now + 0.12) {
           th.roll(roll.next, roll.intensity);
           roll.next += th.rollInterval;
+        }
+      }
+    },
+
+    /**
+     * ボールの音（カジノモード）
+     * @param {'throw'|'drop'|'diamond'|'rotor'|'fret'|'land'|'settle'} kind
+     * @param {number} [v] 強さ 0〜1
+     */
+    /**
+     * パワーをためている間の音（毎フレーム呼ぶ）
+     * @param {number} power 0〜1。負の値で止める
+     */
+    updateCharge(power) {
+      if (!ready()) return;
+      const want = power >= 0 && enabled.ball && !muted;
+      if (!want) {
+        destroyCharge();
+        return;
+      }
+      if (!chargeVoice || chargeVoice.themeId !== themeId) {
+        destroyCharge();
+        chargeVoice = buildCharge();
+      }
+      const now = ctx.currentTime;
+      chargeVoice.osc.frequency.setTargetAtTime(200 + 700 * power, now, 0.012);
+      chargeVoice.out.gain.setTargetAtTime(chargeVoice.level * (0.6 + 0.4 * power), now, 0.03);
+    },
+
+    // パワーが最大に届いた合図
+    chargePeak() {
+      if (!ready() || muted || !enabled.ball) return;
+      const t = ctx.currentTime + 0.002;
+      osc({ t, f: 1760, a: 0.001, d: 0.06, g: 0.07 });
+      osc({ t, f: 2640, a: 0.001, d: 0.04, g: 0.035 });
+    },
+
+    ball(kind, v = 1) {
+      if (!ready() || muted || !enabled.ball) return;
+      const now = ctx.currentTime;
+      if (kind === 'fret' || kind === 'land') {
+        if (now - lastBallHitAt < 0.018) return;
+        lastBallHitAt = now;
+      }
+      const fn = ballSounds()[kind];
+      if (fn) fn(now + 0.002, Math.min(1, Math.max(0.15, v)));
+    },
+
+    /**
+     * ボールが転がる音（毎フレーム呼ぶ）
+     * @param {number} norm 速さ 0〜1
+     * @param {'track'|'bowl'|'rotor'|null} where どこを転がっているか（null なら止める）
+     */
+    updateBall(norm, where) {
+      if (!ready()) return;
+      const now = ctx.currentTime;
+      const want = !!where && enabled.ball && !muted && norm > 0.01;
+      if (want) {
+        if (!ballRoll || ballRoll.themeId !== themeId) {
+          destroyBallRoll();
+          ballRoll = buildBallRoll();
+        }
+        const p = ballRoll.p;
+        const n = Math.min(1, Math.max(0, norm));
+        const place = where === 'rotor' ? 0.45 : where === 'bowl' ? 0.8 : 1;
+        ballRoll.out.gain.setTargetAtTime(p.g * Math.pow(n, 0.8) * place, now, 0.06);
+        if (p.kind === 'osc') {
+          ballRoll.osc.frequency.setTargetAtTime(p.fMin + (p.fMax - p.fMin) * n, now, 0.05);
+        } else {
+          ballRoll.hi.frequency.setTargetAtTime(p.fMin + (p.fMax - p.fMin) * n, now, 0.05);
+          ballRoll.lo.frequency.setTargetAtTime(160 + 260 * n, now, 0.05);
+          ballRoll.lfo.frequency.setTargetAtTime(5 + 22 * n * (0.85 + Math.random() * 0.3), now, 0.05);
+        }
+        ballIdleSince = 0;
+      } else if (ballRoll) {
+        ballRoll.out.gain.setTargetAtTime(0, now, 0.08);
+        if (!ballIdleSince) ballIdleSince = now;
+        if (now - ballIdleSince > 1) {
+          destroyBallRoll();
+          ballIdleSince = 0;
         }
       }
     },

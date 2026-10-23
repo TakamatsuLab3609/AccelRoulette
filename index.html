@@ -18,10 +18,15 @@
       <span class="brand-mark" aria-hidden="true"></span>
       <h1>加速ルーレット</h1>
     </div>
+    <div class="mode-switch" role="radiogroup" aria-label="モード">
+      <button type="button" role="radio" class="mode-btn" data-mode="normal" aria-checked="true">ルーレット</button>
+      <button type="button" role="radio" class="mode-btn" data-mode="casino" aria-checked="false" tabindex="-1">カジノ</button>
+    </div>
     <p class="howto">
       <span class="howto-mouse"><kbd>左クリック</kbd>加速</span>
       <span class="howto-mouse"><kbd>右クリック</kbd>減速</span>
       <span class="howto-keys"><kbd>Space</kbd><kbd>↑</kbd>加速 <kbd>↓</kbd>減速</span>
+      <span class="howto-ball only-casino"><kbd>B</kbd>長押し→離してボール</span>
       <span class="howto-touch"><kbd>盤をタップ</kbd>加速</span>
       <span class="howto-touch"><kbd>減速ボタン</kbd>ブレーキ</span>
     </p>
@@ -30,7 +35,7 @@
   <main class="layout">
     <section class="stage" aria-label="ルーレット">
       <div class="now" aria-live="off">
-        <span class="now-label">針の位置</span>
+        <span class="now-label" id="nowLabel">針の位置</span>
         <span class="now-chip" id="nowChip" aria-hidden="true"></span>
         <span class="now-value" id="nowValue">—</span>
       </div>
@@ -53,8 +58,23 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6l8 6-8 6zM12 6l8 6-8 6z"/></svg>
           <span>加速</span>
         </button>
+        <div class="ball-slot only-casino">
+          <!-- パワーメーター（ボタンの上に出る） -->
+          <div class="power" id="power" hidden aria-hidden="true">
+            <div class="power-head">
+              <span class="power-label">パワー</span>
+              <span class="power-num" id="powerNum">0</span><span class="power-pct">%</span>
+            </div>
+            <div class="power-bar"><div class="power-fill" id="powerFill"></div></div>
+            <div class="power-hint">離すと発射</div>
+          </div>
+          <button type="button" class="ctl ctl-ball" id="btnBall" title="押しているあいだパワーが上下します。離すと発射">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="6.5"/><circle class="ball-shine" cx="9.8" cy="9.6" r="2"/></svg>
+            <span id="btnBallText">ボールを投げる</span>
+          </button>
+        </div>
       </div>
-      <p class="status" id="status" aria-live="polite">盤を左クリックしてスタート</p>
+      <p class="sr-only" id="status" aria-live="polite"></p>
     </section>
 
     <aside class="panel">
@@ -65,7 +85,8 @@
           <button type="button" class="btn-text" id="btnShuffle">シャッフル</button>
         </div>
         <textarea id="itemsInput" spellcheck="false" autocomplete="off" placeholder="1行に1項目ずつ入力&#10;例）&#10;カレー&#10;ラーメン&#10;寿司"></textarea>
-        <p class="hint">改行で区切った順に盤へ並びます。同じ文字列は同じ色。空行は無視されます。</p>
+        <p class="hint only-normal">改行で区切った順に盤へ並びます。同じ文字列は同じ色。空行は無視されます。</p>
+        <p class="hint only-casino">どの項目も同じ数のマスに分けて、交互に並べます（マス数は「操作」タブで調整）。同じ文字列は同じ色。</p>
       </section>
 
       <section class="tabs">
@@ -77,6 +98,19 @@
 
         <!-- 操作 -->
         <div class="tabpanel" role="tabpanel" id="panel-play" aria-labelledby="tab-play">
+          <div class="casino-settings only-casino">
+            <p class="group-title">カジノ</p>
+            <div class="field">
+              <label for="setBallSpeed">最大パワーの勢い <small>メーター100%で投げたときの速さ</small></label>
+              <div class="num"><input type="number" id="setBallSpeed" min="10" max="3000" step="10" inputmode="decimal"><span>rpm</span></div>
+            </div>
+            <div class="field">
+              <label for="setPockets">マス数の目安 <small>項目数で割り切れる一番近い数になる</small></label>
+              <div class="num"><input type="number" id="setPockets" min="2" max="200" step="1" inputmode="decimal"><span>マス</span></div>
+            </div>
+            <div class="divider"></div>
+            <p class="group-title">盤</p>
+          </div>
           <div class="field">
             <label for="setAccel">加速量 <small>左クリック1回</small></label>
             <div class="num"><input type="number" id="setAccel" min="1" step="1" inputmode="decimal"><span>rpm</span></div>
@@ -178,6 +212,7 @@
 <!-- APP:END -->
 
 <script src="sounds.js"></script>
+<script src="casino.js"></script>
 <script src="script.js"></script>
 </body>
 </html>

@@ -5,11 +5,13 @@
  *  - 何もしなければ摩擦で自然に減速して止まる
  *  - 項目はテキスト欄に改行区切り。同じ文字列は同じ色
  *  - 結果ポップアップ・履歴・除外・設定の自動保存（localStorage）
+ *  - カジノモード：ボールが入ったポケットが当たり（ボールは casino.js）
  */
 (() => {
   'use strict';
 
   const Sound = window.RouletteSound;
+  const Casino = window.Casino;
   const $ = (id) => document.getElementById(id);
   const TAU = Math.PI * 2;
 
@@ -34,13 +36,16 @@
     holdEnabled: false,
     holdRate: 8,      // 回 / 秒
     autoRemove: false,
+    mode: 'normal',   // normal = 針で決まる / casino = ボールで決まる
+    ballSpeed: 180,   // カジノ：パワー100%で投げたときのボールの速さ（rpm）
+    pocketTarget: 38, // カジノ：マス数の目安
     theme: 'classic',
     volume: 70,
     muted: false,
-    sounds: Object.freeze({ tick: true, boost: true, brake: true, hum: true, roll: true, result: true }),
+    sounds: Object.freeze({ tick: true, boost: true, brake: true, hum: true, roll: true, result: true, ball: true }),
   });
 
-  const PLAY_KEYS = ['accel', 'brake', 'friction', 'maxSpeed', 'holdEnabled', 'holdRate', 'autoRemove'];
+  const PLAY_KEYS = ['accel', 'brake', 'friction', 'maxSpeed', 'holdEnabled', 'holdRate', 'autoRemove', 'ballSpeed', 'pocketTarget'];
 
   // 加速量・減速量・最高速度は上限なし（JavaScript で扱える最大の数まで）
   const BIG = Number.MAX_VALUE;
@@ -50,6 +55,8 @@
     friction: [0, 50],
     maxSpeed: [0, BIG], // 0 = 無制限
     holdRate: [1, 30],
+    ballSpeed: [10, 3000],
+    pocketTarget: [2, 200],
     volume: [0, 100],
   };
 
@@ -63,8 +70,17 @@
     btnShuffle: $('btnShuffle'),
     wrap: $('wheelWrap'),
     canvas: $('wheel'),
+    nowLabel: $('nowLabel'),
     nowValue: $('nowValue'),
     nowChip: $('nowChip'),
+    modeButtons: [...document.querySelectorAll('.mode-btn')],
+    btnBall: $('btnBall'),
+    btnBallText: $('btnBallText'),
+    power: $('power'),
+    powerNum: $('powerNum'),
+    powerFill: $('powerFill'),
+    setBallSpeed: $('setBallSpeed'),
+    setPockets: $('setPockets'),
     rpmValue: $('rpmValue'),
     rpmFill: $('rpmFill'),
     stateLabel: $('stateLabel'),
@@ -114,6 +130,9 @@
   let history = [];
   let items = [];            // { label, color, ink, line }
   let colorIndex = new Map(); // 文字列 → 色番号（編集しても色が変わりにくいように保持）
+  let pockets = [];          // カジノ：マス（{ itemIndex, label, color, ink }）
+  const ball = new Casino.Ball();
+  let ballDropAt = 0;
 
   const spin = {
     angle: 0,          // ラジアン（時計回りが正）
@@ -159,6 +178,8 @@
       if (typeof raw[key] === 'boolean') s[key] = raw[key];
     }
     if (Sound.THEMES.some((t) => t.id === raw.theme)) s.theme = raw.theme;
+    if (raw.mode === 'normal' || raw.mode === 'casino') s.mode = raw.mode;
+    s.pocketTarget = Math.round(s.pocketTarget);
     if (raw.sounds && typeof raw.sounds === 'object') {
       for (const key of Object.keys(s.sounds)) {
         if (typeof raw.sounds[key] === 'boolean') s.sounds[key] = raw.sounds[key];
@@ -316,11 +337,20 @@
       const c = paletteColor(colorIndex.get(it.label));
       return { ...it, color: c.hex, ink: c.ink };
     });
+    layoutCasino();
+  }
 
-    const kinds = unique.length;
-    el.itemCount.textContent = items.length
-      ? `${items.length} 項目` + (kinds !== items.length ? `（${kinds} 種類）` : '')
-      : '0 項目';
+  // カジノ：等倍率のまま目安の数に近いマスに分けて、交互に並べる
+  function layoutCasino() {
+    pockets = Casino.layoutPockets(items, settings.pocketTarget);
+    updateItemCount();
+  }
+
+  function updateItemCount() {
+    const kinds = new Set(items.map((it) => it.label)).size;
+    let text = items.length ? `${items.length} 項目` + (kinds !== items.length ? `（${kinds} 種類）` : '') : '0 項目';
+    if (settings.mode === 'casino' && items.length) text += ` → ${pockets.length} マス`;
+    el.itemCount.textContent = text;
   }
 
   function onItemsChanged() {
@@ -329,6 +359,12 @@
       spin.active = false;
       spin.rpm = 0;
       Sound.stopRoll();
+    }
+    // マスの並びが変わるので、止まっているボールは片付ける
+    if (!items.length || ball.state === 'settled') {
+      if (ball.inPlay) Sound.stopRoll();
+      cancelReveal();
+      ball.reset();
     }
     spin.boundary = boundaryIndex();
     wheel.rebuild();
@@ -420,6 +456,7 @@
         flashStatus('先に項目を入力してください');
         return;
       }
+      const before = spin.rpm;
       spin.rpm = Math.min(speedCap(), spin.rpm + settings.accel);
       if (!spin.active) {
         spin.active = true;
@@ -430,6 +467,7 @@
       spin.lastAccelAt = now;
       fx.flash = 1;
       Sound.boost();
+      if (settings.mode === 'casino') joltBall(now, ((spin.rpm - before) / 60) * TAU);
     } else {
       if (!spin.active) return;
       spin.rpm = Math.max(0, spin.rpm - settings.brake);
@@ -441,17 +479,22 @@
   function finishSpin(now) {
     spin.active = false;
     spin.rpm = 0;
+    if (settings.mode === 'casino') return; // カジノはボールで決まる
     Sound.stopRoll();
 
     const idx = pointerIndex();
     if (idx < 0) return;
-    const it = items[idx];
+    declareResult(items[idx], now, 'normal');
+  }
+
+  function declareResult(it, now, mode, delay = RESULT_DELAY) {
     const entry = {
       n: (history.length ? history[0].n || history.length : 0) + 1,
       label: it.label,
       color: it.color,
       ink: it.ink,
       at: Date.now(),
+      mode,
     };
     history.unshift(entry);
     if (history.length > MAX_HISTORY) history.length = MAX_HISTORY;
@@ -460,10 +503,304 @@
 
     lastResult = { ...it, entry };
     fx.celebrateUntil = now + 3.2;
-    spin.lockedUntil = now + RESULT_DELAY / 1000;
+    spin.lockedUntil = now + delay / 1000;
     Sound.result();
     releaseAll();
-    setTimeout(() => openResult(lastResult), RESULT_DELAY);
+    setTimeout(() => openResult(lastResult), delay);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* カジノ：ボール                                                        */
+  /* ------------------------------------------------------------------ */
+
+  // パワーメーター：押している間 0% → 100% → 0% … と往復し、離した瞬間のパワーで投げる
+  const POWER_SWEEP = 1.2; // 0% から 100% まで上がる秒数
+  const charge = { active: false, source: null, t0: 0, power: 0, lap: 0, hideAt: 0 };
+
+  // いまボールを投げられるか（だめなときは理由を表示）
+  function canThrow(now, quiet) {
+    if (settings.mode !== 'casino' || modalOpen || now < spin.lockedUntil) return false;
+    if (!items.length) {
+      if (!quiet) flashStatus('先に項目を入力してください');
+      return false;
+    }
+    if (ball.inPlay) {
+      if (!quiet) flashStatus('ボールが止まるまで待ってください');
+      return false;
+    }
+    if (revealPending()) {
+      if (!quiet) flashStatus('結果発表まで待ってください');
+      return false;
+    }
+    return true;
+  }
+
+  function powerAt(now) {
+    const phase = ((now - charge.t0) / POWER_SWEEP) % 2;
+    return phase <= 1 ? phase : 2 - phase;
+  }
+
+  // 押した：メーターを出して、パワーを 0 から動かす
+  function startCharge(source) {
+    Sound.unlock();
+    if (charge.active) return;
+    const now = nowSec();
+    if (!canThrow(now)) return;
+    Object.assign(charge, { active: true, source, t0: now, power: 0, lap: 0, hideAt: 0 });
+    el.power.hidden = false;
+    el.power.classList.remove('is-fired');
+    el.btnBall.classList.add('is-charging');
+    renderPower(0);
+  }
+
+  // 離した：そのときのパワーで投げる
+  function releaseCharge(source) {
+    if (!charge.active || (source && charge.source !== source)) return;
+    const now = nowSec();
+    charge.power = powerAt(now);
+    charge.active = false;
+    Sound.updateCharge(-1);
+    el.btnBall.classList.remove('is-charging');
+    renderPower(charge.power);
+    if (!canThrow(now, true)) {
+      hidePower();
+      return;
+    }
+    launchBall(charge.power);
+    el.power.classList.add('is-fired'); // 投げたパワーを少しだけ見せてから消す
+    charge.hideAt = now + 0.6;
+  }
+
+  function cancelCharge() {
+    if (!charge.active) return;
+    charge.active = false;
+    Sound.updateCharge(-1);
+    hidePower();
+  }
+
+  function hidePower() {
+    el.power.hidden = true;
+    el.power.classList.remove('is-fired');
+    el.btnBall.classList.remove('is-charging');
+    charge.hideAt = 0;
+  }
+
+  function renderPower(p) {
+    el.powerNum.textContent = String(Math.round(p * 100));
+    el.powerFill.style.clipPath = `inset(0 ${(100 - p * 100).toFixed(2)}% 0 0)`;
+  }
+
+  // 毎フレーム：メーターを動かす
+  function updateCharge(now) {
+    if (charge.active) {
+      const lap = Math.floor((now - charge.t0) / POWER_SWEEP);
+      if (lap !== charge.lap) {
+        if (lap % 2 === 1) Sound.chargePeak(); // 100% に届いた
+        charge.lap = lap;
+      }
+      charge.power = powerAt(now);
+      renderPower(charge.power);
+      Sound.updateCharge(charge.power);
+    } else if (charge.hideAt && now >= charge.hideAt) {
+      hidePower();
+    }
+  }
+
+  // 盤と逆向き（反時計回り）に投げる。パワー0%でも少しは転がる
+  function launchBall(power) {
+    const rpm = settings.ballSpeed * (0.15 + 0.85 * power) * (0.97 + Math.random() * 0.06);
+    // 投げ入れる位置は毎回ランダム（どのマスにも同じ確率で入るように）
+    ball.launch(Math.random() * TAU, -(rpm / 60) * TAU);
+    fx.celebrateUntil = 0;
+    fx.flash = 0.6;
+    Sound.ball('throw', 0.3 + 0.7 * power);
+  }
+
+  function stepBall(now, dt, angle0) {
+    if (ball.state === 'idle') return;
+    const omega = spin.active ? (spin.rpm / 60) * TAU : 0;
+    const events = ball.step(dt, angle0, omega, pockets.length);
+    for (const e of events) {
+      if (e.type === 'drop') {
+        ballDropAt = now;
+        Sound.ball('drop');
+      } else if (e.type === 'settle') {
+        Sound.ball('settle');
+        onBallSettled(now);
+      } else {
+        Sound.ball(e.type, (e.v || 0) / 4);
+      }
+    }
+    // ボールが落ちてから止まるまでドラムロール
+    if (ball.inPlay && ball.dropped) {
+      Sound.setRollIntensity(0.25 + 0.75 * clamp((now - ballDropAt) / 2.5, 0, 1));
+      if (!Sound.rolling) Sound.startRoll();
+    }
+  }
+
+  // ボールがマスに入った：すぐには発表せず、ズームアップしてから盤が止まる直前に発表
+  function onBallSettled(now) {
+    Sound.stopRoll();
+    const p = pockets[ball.pocket];
+    const it = p ? items[p.itemIndex] : null;
+    if (it) startReveal(now, it, ball.pocket);
+  }
+
+  // ボールがマスに入ってから結果発表まで：ズームアップ → 盤が止まる直前に発表
+  const ZOOM_IN = 0.7;       // ズームアップにかける秒数
+  const ZOOM_HOLD_MIN = 1.3; // ズームしたまま見せる最短の秒数
+  const ZOOM_HOLD_MAX = 2.3; // 盤がなかなか止まらないときは、ここで全体に戻る
+  const ZOOM_OUT = 0.6;
+  const REVEAL_LEAD = 0.9;   // 盤が止まるこの秒数前に結果のポップアップを出す
+  const REVEAL_POPUP_DELAY = 0.15; // 発表の音を鳴らしてからポップアップが出るまで
+  const REVEAL_AT = REVEAL_LEAD + REVEAL_POPUP_DELAY; // 発表を始める「止まるまでの残り秒数」
+  const reveal = { phase: 'none', t0: 0, start: 0, item: null, pocket: -1, eStart: 0, from: 0 };
+  const cam = { e: 0, theta: 0 }; // e: ズームの度合い（0〜1） theta: 見せるマスの向き
+
+  const normAngle = (a) => a - TAU * Math.round(a / TAU);
+  const easeInOut = (t) => {
+    t = clamp(t, 0, 1);
+    return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+  };
+
+  function pocketCenter(i) {
+    return -Math.PI / 2 + (i + 0.5) * (TAU / Math.max(1, pockets.length));
+  }
+
+  function startReveal(now, it, pocket) {
+    const eStart = reveal.phase === 'abort' ? cam.e : 0; // 引いている途中でまた入ったときは、そこから寄る
+    Object.assign(reveal, { phase: 'zoomIn', t0: now, start: now, item: it, pocket, eStart });
+    cam.theta = normAngle(spin.angle + pocketCenter(pocket));
+    cam.e = eStart;
+    jolt = 0;
+    Sound.ball('zoom');
+  }
+
+  // 結果発表を待っているところか（ボールがマスに入ってから、ポップアップが出るまで）
+  function revealPending() {
+    return reveal.phase !== 'none' && reveal.phase !== 'abort';
+  }
+
+  // ボールが飛び出したとき：ズームを引いて、もう一度入るのを待つ
+  function abortReveal(now) {
+    if (!revealPending()) return;
+    Sound.stopRoll();
+    reveal.item = null;
+    if (cam.e > 0.001) Object.assign(reveal, { phase: 'abort', t0: now, from: cam.e });
+    else reveal.phase = 'none';
+  }
+
+  /* 発表前に盤を急に加速すると、ポケットのボールが飛び出す ---------------- */
+  //   加速するたびにボールへ「揺れ」がたまり、すぐに収まっていく（JOLT_DECAY 秒で約 1/3）
+  //   1〜2回のクリック（初期値 +20 rpm）では揺れるだけ。素早く3回以上の連打・長押し・
+  //   1回 +45 rpm 以上の大きな加速だと飛び出す
+  const JOLT_DECAY = 0.3;
+  const JOLT_EJECT = 1.9; // これを超えたら飛び出す（ボールにかかる勢い：外枠の半径/秒）
+  let jolt = 0;
+  let joltAt = 0;
+
+  function joltBall(now, dOmega) {
+    if (ball.state !== 'settled' || !revealPending() || !(dOmega > 0)) return;
+    const v = Math.min(dOmega * Casino.GEO.POCKET_MID, 50);
+    jolt = jolt * Math.exp(-(now - joltAt) / JOLT_DECAY) + v;
+    joltAt = now;
+    if (jolt >= JOLT_EJECT) {
+      ejectBall(now, jolt);
+      return;
+    }
+    const frac = jolt / JOLT_EJECT;
+    ball.rattle(frac, pockets.length);
+    Sound.ball('fret', 0.25 + 0.5 * frac);
+    if (frac >= 0.6) flashStatus('ボールが揺れた！あと少しで飛び出す');
+  }
+
+  function ejectBall(now, strength) {
+    const omega = spin.active ? (spin.rpm / 60) * TAU : 0;
+    if (!ball.eject(spin.angle, omega, Math.min(strength, 8))) return;
+    jolt = 0;
+    abortReveal(now);
+    ballDropAt = now; // ドラムロールは最初から
+    Sound.ball('eject', Math.min(1, strength / 4));
+    flashStatus('ボールが飛び出した！');
+  }
+
+  function cancelReveal() {
+    if (reveal.phase === 'none') return;
+    reveal.phase = 'none';
+    reveal.item = null;
+    cam.e = 0;
+    Sound.stopRoll();
+  }
+
+  function finishReveal(now) {
+    const it = reveal.item;
+    reveal.phase = 'none';
+    reveal.item = null;
+    cam.e = 0;
+    if (it) declareResult(it, now, 'casino', REVEAL_POPUP_DELAY * 1000);
+  }
+
+  // 毎フレーム：ズームの進み具合と、結果を出すタイミング
+  function stepReveal(now) {
+    if (reveal.phase === 'none') {
+      cam.e = 0;
+      return;
+    }
+    if (reveal.pocket >= pockets.length) {
+      cancelReveal();
+      return;
+    }
+    // 盤と一緒に回るマスを追いかける（角度は飛ばないようにつなげる）
+    cam.theta += normAngle(spin.angle + pocketCenter(reveal.pocket) - cam.theta);
+    if (reveal.phase === 'abort') {
+      // ボールが飛び出した：ズームを引く
+      const ta = now - reveal.t0;
+      cam.e = reveal.from * (1 - easeInOut(ta / 0.35));
+      if (ta >= 0.35) {
+        reveal.phase = 'none';
+        cam.e = 0;
+      }
+      return;
+    }
+    const tts = spin.active ? timeToStop() : 0; // 盤が止まるまでの秒数
+    const t = now - reveal.t0;
+    if (reveal.phase === 'zoomIn') {
+      cam.e = reveal.eStart + (1 - reveal.eStart) * easeInOut(t / ZOOM_IN);
+      if (t >= ZOOM_IN) Object.assign(reveal, { phase: 'hold', t0: now });
+    } else if (reveal.phase === 'hold') {
+      cam.e = 1;
+      if (t >= ZOOM_HOLD_MIN && (tts <= ZOOM_OUT + REVEAL_AT || t >= ZOOM_HOLD_MAX)) {
+        cam.theta = normAngle(cam.theta); // 近い向きを通って全体に戻る
+        Object.assign(reveal, { phase: 'zoomOut', t0: now });
+      }
+    } else if (reveal.phase === 'zoomOut') {
+      cam.e = 1 - easeInOut(t / ZOOM_OUT);
+      if (t >= ZOOM_OUT) {
+        cam.e = 0;
+        Object.assign(reveal, { phase: 'wait', t0: now });
+      }
+    }
+    if (reveal.phase === 'wait' && tts <= REVEAL_AT) {
+      finishReveal(now);
+      return;
+    }
+    // 結果発表に向けてドラムロール
+    if (reveal.phase !== 'zoomIn' && (!spin.active || tts <= ROLL_WINDOW)) {
+      const k = spin.active
+        ? 1 - (tts - REVEAL_AT) / (ROLL_WINDOW - REVEAL_AT)
+        : (now - reveal.start - ZOOM_IN) / (ZOOM_HOLD_MIN + ZOOM_OUT);
+      Sound.setRollIntensity(clamp(k, 0.2, 1));
+      if (!Sound.rolling) Sound.startRoll();
+    } else if (Sound.rolling) {
+      Sound.stopRoll();
+    }
+  }
+
+  // ボールが転がる音の大きさ（ボールの下の面に対する速さ）
+  function ballRollLevel() {
+    if (!ball.inPlay || ball.air > 0) return 0;
+    const surface = ball.state === 'rotor' && spin.active ? (spin.rpm / 60) * TAU : 0;
+    return clamp(Math.hypot(ball.vr, ball.r * (ball.w - surface)) / 10, 0, 1);
   }
 
   /* ------------------------------------------------------------------ */
@@ -499,7 +836,9 @@
     holds.brake.count = 0;
     wheelPointers.clear();
     buttonPointers.clear();
+    ballPointers.clear();
     heldKeys.clear();
+    cancelCharge();
     syncPressedUI();
   }
 
@@ -513,7 +852,7 @@
   function onWheelPointer(e) {
     const ended = e.type === 'pointerup' || e.type === 'pointercancel' || e.type === 'lostpointercapture';
     const prev = wheelPointers.get(e.pointerId) || 0;
-    const cur = ended ? 0 : e.buttons & 3;
+    const cur = ended ? 0 : e.buttons & 7;
     if (e.type === 'pointerdown') {
       e.preventDefault();
       // ボタン等にフォーカスが残っているとキー操作が効かないので外す
@@ -528,14 +867,24 @@
     else wheelPointers.delete(e.pointerId);
     if (pressed & 1) press('accel');
     if (pressed & 2) press('brake');
+    if (pressed & 4) startCharge('middle'); // ホイールクリック（中ボタン）の長押しでもボール
     if (released & 1) release('accel');
     if (released & 2) release('brake');
+    if (released & 4) {
+      if (e.type === 'pointercancel') cancelCharge();
+      else releaseCharge('middle');
+    }
   }
 
   ['pointerdown', 'pointermove', 'pointerup', 'pointercancel', 'lostpointercapture'].forEach((type) => {
     el.wrap.addEventListener(type, onWheelPointer);
   });
   el.wrap.addEventListener('contextmenu', (e) => e.preventDefault());
+  // 中ボタンの自動スクロールを止める
+  el.wrap.addEventListener('mousedown', (e) => {
+    if (e.button === 1) e.preventDefault();
+  });
+  el.wrap.addEventListener('auxclick', (e) => e.preventDefault());
 
   // 画面下の「加速」「減速」ボタン（タッチ向け）
   const buttonPointers = new Map();
@@ -565,9 +914,41 @@
   bindHoldButton(el.btnAccel, 'accel');
   bindHoldButton(el.btnBrake, 'brake');
 
-  // キーボード：Space / ↑ / Enter = 加速、↓ = 減速
+  // 「ボールを投げる」：押している間パワーをためて、離すと発射
+  const ballPointers = new Set();
+  el.btnBall.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault(); // フォーカスを移さない（続けて Space で盤を加速できるように）
+    try { el.btnBall.setPointerCapture(e.pointerId); } catch (err) { /* noop */ }
+    ballPointers.add(e.pointerId);
+    startCharge('button');
+  });
+  el.btnBall.addEventListener('pointerup', (e) => {
+    if (ballPointers.delete(e.pointerId)) releaseCharge('button');
+  });
+  el.btnBall.addEventListener('lostpointercapture', (e) => {
+    if (ballPointers.delete(e.pointerId)) releaseCharge('button');
+  });
+  el.btnBall.addEventListener('pointercancel', (e) => {
+    if (ballPointers.delete(e.pointerId)) cancelCharge();
+  });
+  el.btnBall.addEventListener('contextmenu', (e) => e.preventDefault());
+  // Tab でボタンを選んだとき：Space / Enter を押している間ためる
+  el.btnBall.addEventListener('keydown', (e) => {
+    if (e.key !== ' ' && e.key !== 'Enter') return;
+    e.preventDefault();
+    if (!e.repeat) startCharge('keyboard');
+  });
+  el.btnBall.addEventListener('keyup', (e) => {
+    if (e.key !== ' ' && e.key !== 'Enter') return;
+    e.preventDefault();
+    releaseCharge('keyboard');
+  });
+
+  // キーボード：Space / ↑ / Enter = 加速、↓ = 減速、B = ボールを投げる
   const heldKeys = new Map();
   function keyKind(e) {
+    if (e.code === 'KeyB') return 'ball';
     if (e.code === 'Space' || e.key === 'ArrowUp') return 'accel';
     if (e.key === 'Enter' && e.target === el.wrap) return 'accel';
     if (e.key === 'ArrowDown') return 'brake';
@@ -577,19 +958,32 @@
     return !!(t && t.closest && t.closest('input, textarea, select, button, [contenteditable], [role="tab"], .modal'));
   }
   document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && charge.active) {
+      cancelCharge();
+      return;
+    }
     if (modalOpen) {
       if (e.key === 'Escape') closeResult('close');
       return;
     }
-    if (e.ctrlKey || e.metaKey || e.altKey || isFormTarget(e.target)) return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
     const kind = keyKind(e);
     if (!kind) return;
+    if (kind === 'ball') {
+      // B はボタンにフォーカスがあっても効くように（文字入力中は除く）
+      if (settings.mode !== 'casino' || (e.target.closest && e.target.closest('input, textarea, select, [contenteditable]'))) return;
+      e.preventDefault();
+      if (!e.repeat) startCharge('key');
+      return;
+    }
+    if (isFormTarget(e.target)) return;
     e.preventDefault();
     if (e.repeat || heldKeys.has(e.code)) return;
     heldKeys.set(e.code, kind);
     press(kind);
   });
   document.addEventListener('keyup', (e) => {
+    if (e.code === 'KeyB') releaseCharge('key');
     const kind = heldKeys.get(e.code);
     if (!kind) return;
     heldKeys.delete(e.code);
@@ -618,16 +1012,19 @@
     const canvas = el.canvas;
     const g = canvas.getContext('2d');
     const BULBS = 28;
+    let mode = 'normal';
     let S = 0;      // キャンバスの一辺（デバイスピクセル）
     let dpr = 1;
     let cx = 0;
     let cy = 0;
     let R = 0;      // 外枠の半径
-    let Rf = 0;     // 盤面の半径
-    let back = null;
-    let front = null;
-    let face = null;
-    let spun = null;   // 超高速時用：色が混ざって見える盤
+    let Rf = 0;     // 盤面の半径（通常モード）
+    let base = null;   // 影
+    let stator = null; // カジノ：すり鉢（回らない部分）
+    let top = null;    // 回る部分の上に重ねるもの（ツヤ・中心のハブ）
+    let rim = null;    // 真鍮の外枠と電球のソケット
+    let face = null;   // 回る部分（通常：盤面 / カジノ：ポケットのある回転部）
+    let spun = null;   // 超高速時用：色が混ざって見える回る部分
     let bulbOn = null;
     let bulbOff = null;
     let bulbR = 0;
@@ -646,6 +1043,13 @@
       return c;
     }
 
+    function setMode(m) {
+      mode = m;
+      if (!S) return;
+      buildStatic();
+      rebuild();
+    }
+
     function resize() {
       const css = Math.floor(el.wrap.clientWidth);
       if (!css) return;
@@ -656,43 +1060,109 @@
       canvas.width = S;
       canvas.height = S;
       cx = S / 2;
-      cy = S * 0.525;
-      R = S * 0.445;
+      cy = S * 0.515;
+      R = S * 0.47;
       Rf = R * 0.885;
       buildStatic();
       rebuild();
     }
 
     function buildStatic() {
-      // 影
-      back = makeCanvas(S, S);
-      const b = back.getContext('2d');
+      // 影（カジノはその上にすり鉢）
+      base = makeCanvas(S, S);
+      const b = base.getContext('2d');
       b.save();
       b.shadowColor = 'rgba(0, 0, 0, 0.38)';
-      b.shadowBlur = R * 0.09;
-      b.shadowOffsetY = R * 0.045;
+      b.shadowBlur = R * 0.08;
+      b.shadowOffsetY = R * 0.035;
       b.fillStyle = '#3a2a0c';
       b.beginPath();
       b.arc(cx, cy, R, 0, TAU);
       b.fill();
       b.restore();
+      stator = null;
+      if (mode === 'casino') {
+        stator = makeCanvas(S, S);
+        Casino.drawStator(stator.getContext('2d'), cx, cy, R);
+      }
 
-      // 真鍮の外枠・ツヤ・中心のハブ
-      front = makeCanvas(S, S);
-      const f = front.getContext('2d');
+      // 真鍮の外枠と電球（通常モードだけ。カジノは外枠なしで盤を大きく使う）
+      rim = null;
+      bulbOn = null;
+      bulbOff = null;
+      if (mode === 'normal') buildRim();
 
-      const rim = f.createLinearGradient(cx - R, cy - R, cx + R, cy + R);
-      rim.addColorStop(0, '#f7df97');
-      rim.addColorStop(0.28, '#dcab48');
-      rim.addColorStop(0.55, '#9c6d1b');
-      rim.addColorStop(0.78, '#d7a745');
-      rim.addColorStop(1, '#7a5313');
+      // 回る部分の上に重ねるもの
+      top = makeCanvas(S, S);
+      const t = top.getContext('2d');
+      if (mode === 'casino') {
+        Casino.drawCasinoGloss(t, cx, cy, R);
+      } else {
+        // 盤面のふちの陰り
+        const edge = t.createRadialGradient(cx, cy, Rf * 0.86, cx, cy, Rf);
+        edge.addColorStop(0, 'rgba(0, 0, 0, 0)');
+        edge.addColorStop(1, 'rgba(0, 0, 0, 0.26)');
+        t.fillStyle = edge;
+        t.beginPath();
+        t.arc(cx, cy, Rf, 0, TAU);
+        t.fill();
+        // ツヤ
+        const gloss = t.createRadialGradient(cx - Rf * 0.38, cy - Rf * 0.48, Rf * 0.04, cx - Rf * 0.2, cy - Rf * 0.3, Rf * 1.05);
+        gloss.addColorStop(0, 'rgba(255, 255, 255, 0.24)');
+        gloss.addColorStop(0.45, 'rgba(255, 255, 255, 0.06)');
+        gloss.addColorStop(1, 'rgba(255, 255, 255, 0)');
+        t.fillStyle = gloss;
+        t.beginPath();
+        t.arc(cx, cy, Rf, 0, TAU);
+        t.fill();
+        // ハブ
+        const hr = R * 0.13;
+        t.save();
+        t.shadowColor = 'rgba(0, 0, 0, 0.4)';
+        t.shadowBlur = R * 0.04;
+        t.shadowOffsetY = R * 0.015;
+        const hub = t.createRadialGradient(cx - hr * 0.35, cy - hr * 0.45, hr * 0.1, cx, cy, hr);
+        hub.addColorStop(0, '#fbebb6');
+        hub.addColorStop(0.5, '#d9a845');
+        hub.addColorStop(1, '#8a6118');
+        t.fillStyle = hub;
+        t.beginPath();
+        t.arc(cx, cy, hr, 0, TAU);
+        t.fill();
+        t.restore();
+        t.lineWidth = Math.max(1, R * 0.006);
+        t.strokeStyle = 'rgba(70, 45, 5, 0.7)';
+        t.beginPath();
+        t.arc(cx, cy, hr, 0, TAU);
+        t.stroke();
+        t.beginPath();
+        t.arc(cx, cy, hr * 0.62, 0, TAU);
+        t.strokeStyle = 'rgba(90, 60, 10, 0.45)';
+        t.stroke();
+        const bolt = t.createRadialGradient(cx - hr * 0.08, cy - hr * 0.1, 0, cx, cy, hr * 0.22);
+        bolt.addColorStop(0, '#fff6d6');
+        bolt.addColorStop(1, '#a87a22');
+        t.fillStyle = bolt;
+        t.beginPath();
+        t.arc(cx, cy, hr * 0.2, 0, TAU);
+        t.fill();
+      }
+    }
+
+    function buildRim() {
+      rim = makeCanvas(S, S);
+      const f = rim.getContext('2d');
+      const grad = f.createLinearGradient(cx - R, cy - R, cx + R, cy + R);
+      grad.addColorStop(0, '#f7df97');
+      grad.addColorStop(0.28, '#dcab48');
+      grad.addColorStop(0.55, '#9c6d1b');
+      grad.addColorStop(0.78, '#d7a745');
+      grad.addColorStop(1, '#7a5313');
       f.beginPath();
       f.arc(cx, cy, R, 0, TAU);
       f.arc(cx, cy, Rf, 0, TAU, true);
-      f.fillStyle = rim;
+      f.fillStyle = grad;
       f.fill('evenodd');
-
       f.lineWidth = Math.max(1, R * 0.007);
       f.strokeStyle = 'rgba(70, 45, 5, 0.65)';
       f.beginPath();
@@ -701,70 +1171,15 @@
       f.beginPath();
       f.arc(cx, cy, Rf, 0, TAU);
       f.stroke();
-
-      // 盤面のふちの陰り
-      const edge = f.createRadialGradient(cx, cy, Rf * 0.86, cx, cy, Rf);
-      edge.addColorStop(0, 'rgba(0, 0, 0, 0)');
-      edge.addColorStop(1, 'rgba(0, 0, 0, 0.26)');
-      f.fillStyle = edge;
-      f.beginPath();
-      f.arc(cx, cy, Rf, 0, TAU);
-      f.fill();
-
-      // ツヤ
-      const gloss = f.createRadialGradient(cx - Rf * 0.38, cy - Rf * 0.48, Rf * 0.04, cx - Rf * 0.2, cy - Rf * 0.3, Rf * 1.05);
-      gloss.addColorStop(0, 'rgba(255, 255, 255, 0.24)');
-      gloss.addColorStop(0.45, 'rgba(255, 255, 255, 0.06)');
-      gloss.addColorStop(1, 'rgba(255, 255, 255, 0)');
-      f.fillStyle = gloss;
-      f.beginPath();
-      f.arc(cx, cy, Rf, 0, TAU);
-      f.fill();
-
-      // 電球のソケット
       bulbR = (R - Rf) * 0.27;
       const ringR = (R + Rf) / 2;
       for (let i = 0; i < BULBS; i++) {
         const a = (i / BULBS) * TAU - Math.PI / 2;
-        const x = cx + Math.cos(a) * ringR;
-        const y = cy + Math.sin(a) * ringR;
         f.beginPath();
-        f.arc(x, y, bulbR * 1.35, 0, TAU);
+        f.arc(cx + Math.cos(a) * ringR, cy + Math.sin(a) * ringR, bulbR * 1.35, 0, TAU);
         f.fillStyle = 'rgba(60, 38, 4, 0.55)';
         f.fill();
       }
-
-      // ハブ
-      const hr = R * 0.13;
-      f.save();
-      f.shadowColor = 'rgba(0, 0, 0, 0.4)';
-      f.shadowBlur = R * 0.04;
-      f.shadowOffsetY = R * 0.015;
-      const hub = f.createRadialGradient(cx - hr * 0.35, cy - hr * 0.45, hr * 0.1, cx, cy, hr);
-      hub.addColorStop(0, '#fbebb6');
-      hub.addColorStop(0.5, '#d9a845');
-      hub.addColorStop(1, '#8a6118');
-      f.fillStyle = hub;
-      f.beginPath();
-      f.arc(cx, cy, hr, 0, TAU);
-      f.fill();
-      f.restore();
-      f.lineWidth = Math.max(1, R * 0.006);
-      f.strokeStyle = 'rgba(70, 45, 5, 0.7)';
-      f.beginPath();
-      f.arc(cx, cy, hr, 0, TAU);
-      f.stroke();
-      f.beginPath();
-      f.arc(cx, cy, hr * 0.62, 0, TAU);
-      f.strokeStyle = 'rgba(90, 60, 10, 0.45)';
-      f.stroke();
-      const bolt = f.createRadialGradient(cx - hr * 0.08, cy - hr * 0.1, 0, cx, cy, hr * 0.22);
-      bolt.addColorStop(0, '#fff6d6');
-      bolt.addColorStop(1, '#a87a22');
-      f.fillStyle = bolt;
-      f.beginPath();
-      f.arc(cx, cy, hr * 0.2, 0, TAU);
-      f.fill();
 
       // 電球のスプライト
       const sz = bulbR * 6;
@@ -806,9 +1221,18 @@
       return chars.slice(0, lo).join('') + '…';
     }
 
-    // 回転する盤面（項目が変わったときだけ描き直す）
+    // 回る部分（項目が変わったときだけ描き直す）
     function rebuild() {
       if (!S) return;
+      if (mode === 'casino') {
+        const size = Math.ceil(Casino.GEO.ROTOR * R * 2) + 4;
+        face = makeCanvas(size, size);
+        Casino.drawRotor(face.getContext('2d'), size / 2, R, pockets, { font: LABEL_FONT, dpr });
+        spun = makeCanvas(size, size);
+        Casino.drawRotor(spun.getContext('2d'), size / 2, R, pockets, { font: LABEL_FONT, dpr, spun: true });
+        return;
+      }
+
       const size = Math.ceil(Rf * 2) + 4;
       spun = null;
       face = makeCanvas(size, size);
@@ -951,9 +1375,10 @@
 
     function bulbLevel(i, now) {
       let lv;
+      const chasing = spin.active || (mode === 'casino' && ball.inPlay);
       if (now < fx.celebrateUntil) {
         lv = (Math.floor(now * 7) + i) % 2 ? 1 : 0.12;
-      } else if (spin.active) {
+      } else if (chasing) {
         const k = (((i - Math.floor(fx.bulbPhase)) % 4) + 4) % 4;
         lv = k === 0 ? 1 : k === 1 ? 0.45 : 0.1;
       } else {
@@ -1017,48 +1442,156 @@
       g.restore();
     }
 
+    // カジノ：ボール（と、速いときの残像）
+    function drawBall(mix) {
+      if (ball.state === 'idle') return;
+      const GEO = Casino.GEO;
+      const pos = ball.position(spin.angle);
+      const h = ball.height();
+      const appear = ball.appear;
+      if (ball.inPlay) {
+        const speed = Math.hypot(ball.vr, ball.r * ball.w);
+        const ta = clamp((speed - 1.2) / 5, 0, 1) * appear;
+        if (ta > 0.02) {
+          Casino.drawTrail(g, cx, cy, R, ball.trailPrev, ta * 0.6);
+          Casino.drawTrail(g, cx, cy, R, ball.trail, ta);
+        }
+      }
+      let alpha = appear;
+      if (ball.state === 'settled' && mix > 0) {
+        // 盤が速すぎるときは、ボールも輪のようにぼやけて見える
+        g.save();
+        g.globalAlpha = 0.35 * mix;
+        g.strokeStyle = '#f5f2ea';
+        g.lineWidth = GEO.BALL * R * 1.6;
+        g.beginPath();
+        g.arc(cx, cy, pos.r * R, 0, TAU);
+        g.stroke();
+        g.restore();
+        alpha *= 1 - 0.7 * mix;
+      }
+      const x = cx + Math.cos(pos.th) * pos.r * R;
+      const y = cy + Math.sin(pos.th) * pos.r * R;
+      const rad = GEO.BALL * R * (1 + h * 2.2) * (0.6 + 0.4 * appear);
+      Casino.drawBall(g, x, y, rad, alpha, h * R);
+    }
+
+    // カジノ：ボールがマスに入ったときのズームアップ（盤と一緒に回るカメラ）
+    //   マスが右向きになるように回すので、項目名が横書きで読める
+    const ZOOM = 2.7;     // 拡大率
+    const FOCUS_R = 0.58; // 画面の真ん中に持ってくる位置（ボールのマスと項目名の間）
+
+    function applyCamera(e) {
+      const th = cam.theta;
+      const z = 1 + (ZOOM - 1) * e;
+      g.translate(cx, cy);
+      g.scale(z, z);
+      g.rotate(-th * e);
+      g.translate(-(cx + Math.cos(th) * FOCUS_R * R * e), -(cy + Math.sin(th) * FOCUS_R * R * e));
+    }
+
+    // ズーム中の「レンズ」：ふちを暗くして真鍮の枠をつける
+    function drawLens(e) {
+      g.save();
+      const v = g.createRadialGradient(cx, cy, R * 0.5, cx, cy, R);
+      v.addColorStop(0, 'rgba(0, 0, 0, 0)');
+      v.addColorStop(1, `rgba(0, 0, 0, ${(0.5 * e).toFixed(3)})`);
+      g.fillStyle = v;
+      g.beginPath();
+      g.arc(cx, cy, R, 0, TAU);
+      g.fill();
+      g.globalAlpha = e;
+      const ring = g.createLinearGradient(cx - R, cy - R, cx + R, cy + R);
+      ring.addColorStop(0, '#f7df97');
+      ring.addColorStop(0.3, '#dcab48');
+      ring.addColorStop(0.55, '#9c6d1b');
+      ring.addColorStop(0.8, '#d7a745');
+      ring.addColorStop(1, '#7a5313');
+      g.lineWidth = R * 0.028;
+      g.strokeStyle = ring;
+      g.beginPath();
+      g.arc(cx, cy, R - R * 0.014, 0, TAU);
+      g.stroke();
+      g.restore();
+    }
+
     function draw(now, dt) {
       if (!S || !face) return;
       g.setTransform(1, 0, 0, 1, 0, 0);
       g.clearRect(0, 0, S, S);
-      g.drawImage(back, 0, 0);
+      g.drawImage(base, 0, 0);
 
+      const lens = mode === 'casino' ? clamp(cam.e, 0, 1) : 0;
+      g.save();
+      if (lens > 0.001) {
+        g.beginPath();
+        g.arc(cx, cy, R, 0, TAU);
+        g.clip();
+        applyCamera(lens);
+      }
       // 1フレームで回る角度。フレーム間隔のゆらぎで見た目がちらつかないよう平滑化
       const raw = Math.min(BLEND_END * 2, (spin.rpm / 60) * TAU * Math.min(dt, 1 / 30));
       visStep = spin.active ? visStep + (raw - visStep) * 0.25 : 0;
-      const step = visStep;
+      const zoomed = lens > 0.001;
+      const step = zoomed ? 0 : visStep; // ズーム中はカメラが盤と一緒に回るので、ぶれて見えない
       const mix = spun ? clamp((step - BLEND_START) / (BLEND_END - BLEND_START), 0, 1) : 0;
       const half = face.width / 2;
 
+      if (zoomed) {
+        // ズーム中はその場で描き直して、拡大しても文字やふちがぼやけないように
+        Casino.drawStator(g, cx, cy, R);
+        g.save();
+        g.translate(cx, cy);
+        g.rotate(spin.angle);
+        Casino.drawRotor(g, 0, R, pockets, { font: LABEL_FONT, dpr });
+        g.restore();
+      } else if (stator) {
+        g.drawImage(stator, 0, 0);
+      }
+
       // 速いときはモーションブラー（数枚を少しずつずらして重ねる）
-      if (mix < 1) {
+      if (!zoomed && mix < 1) {
         const span = Math.min(step, BLEND_END);
         const layers = span > 0.03 ? Math.min(16, Math.ceil(span / 0.025)) : 1;
         for (let k = 0; k < layers; k++) {
+          g.save();
           g.globalAlpha = 1 / (k + 1);
-          g.setTransform(1, 0, 0, 1, cx, cy);
+          g.translate(cx, cy);
           g.rotate(spin.angle - (span * k) / layers);
           g.drawImage(face, -half, -half);
+          g.restore();
         }
       }
       // さらに速いと色が混ざった盤に切り替え、ストロボのようなちらつきを少し重ねる
-      if (mix > 0) {
-        g.setTransform(1, 0, 0, 1, cx, cy);
+      if (!zoomed && mix > 0) {
+        g.save();
+        g.translate(cx, cy);
         g.globalAlpha = mix;
         g.drawImage(spun, -half, -half);
         g.globalAlpha = 0.16 * mix;
         g.rotate(Math.random() * TAU);
         g.drawImage(face, -half, -half);
+        g.restore();
       }
-      g.globalAlpha = 1;
-      g.setTransform(1, 0, 0, 1, 0, 0);
 
-      g.drawImage(front, 0, 0);
-      drawBulbs(now);
-      drawPointer();
+      if (mode === 'casino') {
+        if (ball.state === 'settled' && pockets.length) {
+          Casino.drawPocketGlow(g, cx, cy, R, spin.angle, pockets.length, ball.pocket, 0.5 + 0.5 * Math.sin(now * 6));
+        }
+        drawBall(mix);
+        g.restore(); // カメラを戻す
+        g.drawImage(top, 0, 0); // ツヤは画面に固定
+        if (lens > 0.001) drawLens(lens);
+      } else {
+        g.restore();
+        g.drawImage(top, 0, 0);
+        g.drawImage(rim, 0, 0);
+        drawBulbs(now);
+        drawPointer();
+      }
     }
 
-    return { resize, rebuild, draw };
+    return { resize, rebuild, draw, setMode };
   })();
 
   /* ------------------------------------------------------------------ */
@@ -1084,6 +1617,9 @@
       }
     }
 
+    const casino = settings.mode === 'casino';
+    const angle0 = spin.angle; // このフレーム開始時の盤の角度（ボールの計算用）
+
     if (spin.active) {
       const cap = speedCap();
       if (spin.rpm > cap) spin.rpm = cap;
@@ -1096,27 +1632,36 @@
       const frac = revs < 2 ** 40 ? revs % 1 : Math.random();
       spin.angle = (((spin.angle + frac * TAU) % TAU) + TAU) % TAU;
 
-      // 針がピンを越えた（1フレームで1区画以上回ったときも含む）
-      const bi = boundaryIndex();
-      const crossed = bi !== spin.boundary || revs * items.length >= 1;
-      spin.boundary = bi;
-      if (crossed) {
-        fx.flap = Math.min(0.42, fx.flap + 0.3);
-        if (fx.flapV < 0) fx.flapV = 0;
-        Sound.tick(spin.rpm / SOUND_REF_RPM);
-      }
+      if (!casino) {
+        // 針がピンを越えた（1フレームで1区画以上回ったときも含む）
+        const bi = boundaryIndex();
+        const crossed = bi !== spin.boundary || revs * items.length >= 1;
+        spin.boundary = bi;
+        if (crossed) {
+          fx.flap = Math.min(0.42, fx.flap + 0.3);
+          if (fx.flapV < 0) fx.flapV = 0;
+          Sound.tick(spin.rpm / SOUND_REF_RPM);
+        }
 
-      // 止まる直前のドラムロール
-      const tts = timeToStop();
-      const wantRoll = spin.rpm > 0 && tts <= ROLL_WINDOW && now - spin.lastAccelAt > 0.35;
-      if (wantRoll) {
-        Sound.setRollIntensity(1 - tts / ROLL_WINDOW);
-        if (!Sound.rolling) Sound.startRoll();
-      } else if (Sound.rolling) {
-        Sound.stopRoll();
+        // 止まる直前のドラムロール
+        const tts = timeToStop();
+        const wantRoll = spin.rpm > 0 && tts <= ROLL_WINDOW && now - spin.lastAccelAt > 0.35;
+        if (wantRoll) {
+          Sound.setRollIntensity(1 - tts / ROLL_WINDOW);
+          if (!Sound.rolling) Sound.startRoll();
+        } else if (Sound.rolling) {
+          Sound.stopRoll();
+        }
       }
 
       if (spin.rpm <= 0) finishSpin(now);
+    }
+
+    if (casino) {
+      stepBall(now, dt, angle0);
+      stepReveal(now);
+    } else {
+      cam.e = 0;
     }
 
     // 針のばね
@@ -1129,16 +1674,25 @@
     }
 
     fx.flash = Math.max(0, fx.flash - dt * 3.5);
-    fx.bulbPhase = (fx.bulbPhase + Math.min(spin.rpm, 600) * dt * 0.06) % 4;
+    const chaseRpm = casino && ball.inPlay ? Math.max(spin.rpm, ball.rpm()) : spin.rpm;
+    fx.bulbPhase = (fx.bulbPhase + Math.min(chaseRpm, 600) * dt * 0.06) % 4;
 
-    const tickRate = items.length ? (spin.rpm / 60) * items.length : 0;
+    const slots = casino ? pockets.length : items.length;
+    const tickRate = slots ? (spin.rpm / 60) * slots : 0;
     Sound.update(Math.min(1, spin.rpm / SOUND_REF_RPM), tickRate, spin.active);
+    Sound.updateBall(casino ? ballRollLevel() : 0, casino && ball.inPlay ? ball.state : null);
   }
 
   function updateHud(now) {
-    // 針の位置
-    const idx = pointerIndex();
-    const it = idx >= 0 ? items[idx] : null;
+    const casino = settings.mode === 'casino';
+    // 針の位置（カジノはボールの真下のマス）
+    let it = null;
+    if (casino) {
+      if (ball.state !== 'idle' && pockets.length) it = pockets[ball.pocketUnder(spin.angle, pockets.length)] || null;
+    } else {
+      const idx = pointerIndex();
+      it = idx >= 0 ? items[idx] : null;
+    }
     const key = it ? it.label + '\u0000' + it.color : '';
     if (key !== lastNowKey) {
       lastNowKey = key;
@@ -1157,26 +1711,59 @@
       el.rpmFill.style.width = `${clamp(ratio * 100, 0, 100)}%`;
     }
 
-    let state;
-    if (!spin.active) state = spin.everSpun ? '停止' : '待機中';
-    else if (Sound.rolling || timeToStop() <= ROLL_WINDOW) state = 'まもなく停止';
-    else if (now - spin.lastAccelAt < 0.6) state = '加速中';
-    else state = settings.friction > 0 ? '減速中' : '回転中';
+    // 状態（速度計の下）
+    const state = stateText(now, casino);
     if (state !== lastState) {
       lastState = state;
       el.stateLabel.textContent = state;
+      el.stateLabel.title = state;
     }
-
-    let status;
-    if (now < tempStatus.until) status = tempStatus.text;
-    else if (!items.length) status = touchOnly.matches ? '下の欄に項目を入力してください' : '右の欄に項目を入力してください';
-    else if (spin.active) status = touchOnly.matches ? '盤をタップで加速 · 減速ボタンでブレーキ' : '左クリックで加速 · 右クリックで減速';
-    else if (lastResult && spin.everSpun) status = `結果：${lastResult.label}　もう一度回すには盤をクリック`;
-    else status = touchOnly.matches ? '盤をタップしてスタート' : '盤を左クリックしてスタート';
+    // 読み上げ用（数字が変わるたびには読ませない）
+    const status = state.replace(/\s*[\d,.]+\s*rpm$/, '');
     if (status !== lastStatus) {
       lastStatus = status;
       el.status.textContent = status;
     }
+
+    // ボールを投げるボタン
+    const ballUi = !casino ? 'idle' : ball.inPlay ? 'busy' : revealPending() ? 'waiting' : charge.active ? 'charging' : 'idle';
+    if (ballUi !== lastBallBusy) {
+      lastBallBusy = ballUi;
+      el.btnBall.disabled = ballUi === 'busy' || ballUi === 'waiting';
+      el.btnBallText.textContent = {
+        busy: 'ボール投入中',
+        waiting: '結果発表を待っています',
+        charging: '離して発射',
+        idle: 'ボールを投げる',
+      }[ballUi];
+    }
+  }
+
+  let lastBallBusy = null;
+
+  function stateText(now, casino) {
+    if (now < tempStatus.until) return tempStatus.text;
+    if (!items.length) return touchOnly.matches ? '下の欄に項目を入力してください' : '右の欄に項目を入力してください';
+    if (casino) {
+      if (charge.active) return '離すと発射！';
+      if (reveal.phase === 'zoomIn' || reveal.phase === 'hold') return 'ボールが入った！';
+      if (revealPending()) {
+        if (!spin.active) return 'まもなく結果発表…';
+        return settings.friction > 0 ? '盤が止まると結果発表…' : '右クリックで盤を止めると結果発表';
+      }
+      if (ball.state === 'track') return `ボール周回中 ${Math.round(ball.rpm())} rpm`;
+      if (ball.state === 'bowl') return 'ボールが落ちた！';
+      if (ball.state === 'rotor') return 'ボールが跳ねている…';
+      if (ball.state === 'settled' && lastResult) return `結果：${lastResult.label}`;
+      return touchOnly.matches ? 'ボールを長押し → 離して発射' : '長押しでパワー → 離して発射（B）';
+    }
+    if (spin.active) {
+      if (Sound.rolling || timeToStop() <= ROLL_WINDOW) return 'まもなく停止';
+      if (now - spin.lastAccelAt < 0.6) return '加速中';
+      return settings.friction > 0 ? '減速中' : '回転中';
+    }
+    if (lastResult && lastResult.entry.mode !== 'casino' && spin.everSpun) return `結果：${lastResult.label}`;
+    return touchOnly.matches ? '盤をタップしてスタート' : '盤を左クリックしてスタート';
   }
 
   const fmtInt = new Intl.NumberFormat('ja-JP', { maximumFractionDigits: 0 });
@@ -1198,6 +1785,7 @@
     if (dt > 0.05) dt = 0.05;
     const now = ts / 1000;
     step(now, dt);
+    updateCharge(nowSec());
     wheel.draw(now, dt);
     updateHud(now);
     requestAnimationFrame(frame);
@@ -1214,7 +1802,7 @@
     el.resultBand.style.setProperty('--c', res.color);
     el.resultBand.style.setProperty('--t', res.ink);
     el.resultTitle.textContent = res.label;
-    el.resultMeta.textContent = `第 ${res.entry.n} 回の結果`;
+    el.resultMeta.textContent = `第 ${res.entry.n} 回の結果` + (res.entry.mode === 'casino' ? '（カジノ）' : '');
     const dup = items.filter((x) => x.label === res.label).length;
     el.btnRemoveOne.hidden = settings.autoRemove;
     el.btnRemoveAll.hidden = settings.autoRemove || dup < 2;
@@ -1401,8 +1989,17 @@
       chip.style.background = h.color;
       const label = document.createElement('span');
       label.className = 'h-label';
-      label.textContent = h.label;
       label.title = h.label;
+      const text = document.createElement('span');
+      text.className = 'h-label-text';
+      text.textContent = h.label;
+      label.append(text);
+      if (h.mode === 'casino') {
+        const tag = document.createElement('span');
+        tag.className = 'h-tag';
+        tag.textContent = 'カジノ';
+        label.append(tag);
+      }
       const time = document.createElement('span');
       time.className = 'h-time';
       time.textContent = h.at ? formatTime(h.at) : '';
@@ -1472,6 +2069,8 @@
     [el.setFriction, 'friction'],
     [el.setMax, 'maxSpeed'],
     [el.setHoldRate, 'holdRate'],
+    [el.setBallSpeed, 'ballSpeed'],
+    [el.setPockets, 'pocketTarget'],
   ];
 
   function fillPlaySettings() {
@@ -1493,12 +2092,27 @@
       const v = parseFloat(input.value);
       if (!Number.isFinite(v)) return;
       settings[key] = clamp(v, LIMITS[key][0], LIMITS[key][1]);
+      if (key === 'pocketTarget') {
+        settings.pocketTarget = Math.round(settings.pocketTarget);
+        onPocketsChanged();
+      }
       saveSoon();
     });
     input.addEventListener('change', () => {
       input.value = settings[key];
     });
   });
+
+  // マス数の目安が変わった
+  function onPocketsChanged() {
+    const before = pockets.length;
+    layoutCasino();
+    if (pockets.length !== before && ball.state === 'settled') {
+      cancelReveal();
+      ball.reset();
+    }
+    if (settings.mode === 'casino') wheel.rebuild();
+  }
 
   el.setHold.addEventListener('change', () => {
     settings.holdEnabled = el.setHold.checked;
@@ -1516,6 +2130,7 @@
       settings[k] = DEFAULTS[k];
     });
     fillPlaySettings();
+    onPocketsChanged();
     saveState();
     flashStatus('操作の設定を初期値に戻しました');
   });
@@ -1608,6 +2223,57 @@
   }
 
   /* ------------------------------------------------------------------ */
+  /* モード（ルーレット / カジノ）                                            */
+  /* ------------------------------------------------------------------ */
+
+  function setMode(m) {
+    if ((m !== 'normal' && m !== 'casino') || m === settings.mode) return;
+    settings.mode = m;
+    cancelCharge();
+    hidePower();
+    cancelReveal();
+    ball.reset();
+    Sound.stopRoll();
+    Sound.updateBall(0, null);
+    spin.boundary = boundaryIndex();
+    applyModeUI();
+    wheel.setMode(m);
+    saveSoon();
+  }
+
+  function applyModeUI() {
+    const casino = settings.mode === 'casino';
+    document.body.dataset.mode = settings.mode;
+    el.modeButtons.forEach((btn) => {
+      const on = btn.dataset.mode === settings.mode;
+      btn.setAttribute('aria-checked', String(on));
+      btn.tabIndex = on ? 0 : -1;
+    });
+    el.nowLabel.textContent = casino ? 'ボールの位置' : '針の位置';
+    updateItemCount();
+    lastNowKey = null;
+    lastState = '';
+    lastBallBusy = null;
+  }
+
+  el.modeButtons.forEach((btn, i) => {
+    btn.addEventListener('pointerdown', (e) => {
+      if (e.pointerType === 'mouse') e.preventDefault();
+    });
+    btn.addEventListener('click', () => {
+      Sound.unlock();
+      setMode(btn.dataset.mode);
+    });
+    btn.addEventListener('keydown', (e) => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      e.preventDefault();
+      const next = el.modeButtons[(i + 1) % el.modeButtons.length];
+      setMode(next.dataset.mode);
+      next.focus();
+    });
+  });
+
+  /* ------------------------------------------------------------------ */
   /* 起動                                                                 */
   /* ------------------------------------------------------------------ */
 
@@ -1620,11 +2286,13 @@
   fillPlaySettings();
   parseItems();
   renderHistory();
+  applyModeUI();
 
   // 最初は1番目の項目の真ん中に針が来るように
   spin.angle = -segAngle() / 2;
   spin.boundary = boundaryIndex();
 
+  wheel.setMode(settings.mode);
   wheel.resize();
   if ('ResizeObserver' in window) {
     new ResizeObserver(() => wheel.resize()).observe(el.wrap);
